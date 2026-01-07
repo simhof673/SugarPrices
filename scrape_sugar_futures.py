@@ -3,105 +3,163 @@ import csv
 import os
 import sys
 from datetime import datetime
-from zoneinfo import ZoneInfo
+from urllib.parse import unquote
 
 import requests
-from bs4 import BeautifulSoup
 
-URL = "https://www.barchart.com/futures/quotes/SB*0/futures-prices"
+try:
+    from zoneinfo import ZoneInfo  # py3.9+
+except ImportError:
+    ZoneInfo = None
+
+
+BARCHART_PAGE = "https://www.barchart.com/futures/quotes/SB*0/futures-prices"
+BARCHART_API = "https://www.barchart.com/proxies/core-api/v1/quotes/get"
 OUTFILE = "sugar-futures.csv"
 
-BASE_HEADER = [
-    "Contract", "Latest", "Change", "Open", "High", "Low",
-    "Previous", "Volume", "Open Int", "Time"
+FIELDS = [
+    "symbol",
+    "lastPrice",
+    "priceChange",
+    "openPrice",
+    "highPrice",
+    "lowPrice",
+    "previousPrice",
+    "volume",
+    "openInterest",
+    "tradeTime",
 ]
 
-def today_berlin_iso() -> str:
-    return datetime.now(ZoneInfo("Europe/Berlin")).date().isoformat()
 
-def already_written_today(today_iso: str) -> bool:
-    if not os.path.exists(OUTFILE):
-        return False
-    with open(OUTFILE, "r", newline="", encoding="utf-8") as f:
-        for line in f:
-            if line.startswith(today_iso + ",") or line.startswith(today_iso + ";"):
-                return True
-    return False
+def berlin_now():
+    if ZoneInfo is None:
+        raise RuntimeError("Python <3.9: zoneinfo nicht verfügbar.")
+    return datetime.now(tz=ZoneInfo("Europe/Berlin"))
 
-def fetch_html() -> str:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; sugar-futures-bot/1.0; +https://github.com/)"
+
+def should_run_at_10_berlin(now_berlin: datetime) -> bool:
+    # Wir lassen den Workflow 08:00 & 09:00 UTC laufen und schreiben nur,
+    # wenn es in Berlin genau 10 Uhr ist (DST-sicher).
+    return now_berlin.hour == 10
+
+
+def fetch_rows() -> list[dict]:
+    s = requests.Session()
+
+    # 1) Seite einmal aufrufen, um XSRF-Cookie zu bekommen
+    get_headers = {
+        "user-agent": "Mozilla/5.0",
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "en-US,en;q=0.9",
     }
-    r = requests.get(URL, headers=headers, timeout=60)
+    r = s.get(BARCHART_PAGE, headers=get_headers, timeout=30)
     r.raise_for_status()
-    return r.text
 
-def parse_first_6_rows(html: str):
-    soup = BeautifulSoup(html, "lxml")
+    xsrf = s.cookies.get("XSRF-TOKEN")
+    if not xsrf:
+        raise RuntimeError("Kein XSRF-TOKEN Cookie erhalten (Barchart Block/Änderung?).")
 
-    tables = soup.find_all("table")
-    target_table = None
-    for t in tables:
-        th_text = " ".join(th.get_text(" ", strip=True) for th in t.find_all("th"))
-        if "Contract" in th_text and "Latest" in th_text:
-            target_table = t
-            break
+    # Laut Praxis muss der Token oft URL-decoded werden (teils doppelt). :contentReference[oaicite:1]{index=1}
+    xsrf_decoded = unquote(unquote(xsrf))
 
-    if target_table is None:
-        raise RuntimeError(
-            "Konnte die Tabelle nicht finden. "
-            "Falls die Seite Daten per JavaScript lädt, brauchen wir den API/XHR-Endpoint."
-        )
+    # 2) Interne API abfragen
+    api_headers = {
+        "user-agent": "Mozilla/5.0",
+        "accept": "application/json",
+        "accept-language": "en-US,en;q=0.9",
+        "referer": BARCHART_PAGE,
+        "x-xsrf-token": xsrf_decoded,
+    }
 
-    tbody = target_table.find("tbody") or target_table
-    rows = tbody.find_all("tr")
+    params = {
+        "fields": ",".join(FIELDS),
+        "list": "futures.contractInRoot",
+        "root": "SB",
+        "raw": "1",
+    }
 
-    data_rows = []
-    for tr in rows:
-        tds = tr.find_all(["td", "th"])
-        if not tds:
-            continue
+    j = s.get(BARCHART_API, params=params, headers=api_headers, timeout=30)
+    j.raise_for_status()
+    data = j.json()
 
-        cells = [td.get_text(" ", strip=True) for td in tds]
+    results = data.get("results") or []
+    if not results:
+        raise RuntimeError(f"Keine results erhalten. Antwort keys: {list(data.keys())}")
 
-        if len(cells) >= 10:
-            cells = cells[:10]
-            if cells[0] and (cells[0].startswith("SB") or "SB" in cells[0]):
-                data_rows.append(cells)
+    # Die Seite zeigt „Nearby“; i.d.R. ist die API bereits passend sortiert.
+    # Wir nehmen die ersten 6.
+    return results[:6]
 
-        if len(data_rows) == 6:
-            break
 
-    if len(data_rows) < 6:
-        raise RuntimeError(f"Es wurden nur {len(data_rows)} Datenzeilen gefunden (erwartet: 6).")
-
-    return data_rows
-
-def append_to_csv(rows, today_iso: str):
-    file_exists = os.path.exists(OUTFILE)
-    header = ["Date"] + BASE_HEADER
-
-    with open(OUTFILE, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        if not file_exists:
+def ensure_header(path: str, header: list[str]) -> None:
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
             w.writerow(header)
-        for r in rows:
-            w.writerow([today_iso] + r)
 
-def main():
-    today_iso = today_berlin_iso()
-    print(f"Berlin date: {today_iso}")
 
-    if already_written_today(today_iso):
-        print(f"Already written for {today_iso} — skipping.")
+def append_rows(path: str, date_str: str, rows: list[dict]) -> int:
+    header = ["Date"] + [
+        "Contract",
+        "Latest",
+        "Change",
+        "Open",
+        "High",
+        "Low",
+        "Previous",
+        "Volume",
+        "Open Int",
+        "Time",
+    ]
+    ensure_header(path, header)
+
+    def norm(v):
+        if v is None:
+            return ""
+        return str(v)
+
+    written = 0
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+
+        for item in rows:
+            # "symbol" entspricht i.d.R. dem Contract-Code (z.B. SBH26).
+            # Falls Barchart stattdessen "contractSymbol" liefert, nimm das als Fallback.
+            contract = item.get("symbol") or item.get("contractSymbol") or ""
+
+            line = [
+                date_str,
+                contract,
+                norm(item.get("lastPrice")),
+                norm(item.get("priceChange")),
+                norm(item.get("openPrice")),
+                norm(item.get("highPrice")),
+                norm(item.get("lowPrice")),
+                norm(item.get("previousPrice")),
+                norm(item.get("volume")),
+                norm(item.get("openInterest")),
+                norm(item.get("tradeTime")),
+            ]
+            w.writerow(line)
+            written += 1
+
+    return written
+
+
+def main() -> int:
+    now = berlin_now()
+    print(f"Berlin datetime: {now.isoformat()}")
+
+    if not should_run_at_10_berlin(now):
+        print("Not 10:00 in Berlin – exiting without writing.")
         return 0
 
-    html = fetch_html()
-    rows = parse_first_6_rows(html)
-    append_to_csv(rows, today_iso)
-
-    print(f"Appended 6 rows for {today_iso} to {OUTFILE}.")
+    date_str = now.date().isoformat()
+    rows = fetch_rows()
+    n = append_rows(OUTFILE, date_str, rows)
+    print(f"Appended {n} rows to {OUTFILE}")
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())
