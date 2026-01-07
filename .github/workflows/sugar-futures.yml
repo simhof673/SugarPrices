@@ -1,12 +1,11 @@
-name: Sugar futures to CSV
+name: Sugar futures scrape
 
 on:
+  workflow_dispatch:
   schedule:
-    # GitHub cron is UTC only. We trigger at 08:00 and 09:00 UTC and the script
-    # will only run when it's 10:00 in Europe/Berlin (covers CET/CEST).
-    
+    # GitHub cron ist UTC. Wir triggern 08:00 & 09:00 UTC
+    # und das Script schreibt nur, wenn es 10:00 in Europe/Berlin ist (DST-sicher).
     - cron: "0 9 * * *"
-  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -18,27 +17,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml
+          pip install requests
 
       - name: Run scraper
         run: |
           python scrape_sugar_futures.py
 
-      - name: Commit and push if changed
+      - name: Commit & push if changed
         run: |
           if git status --porcelain | grep -q "sugar-futures.csv"; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add sugar-futures.csv
-            git commit -m "Update sugar-futures.csv"
+            git commit -m "Update sugar futures CSV"
             git push
           else
             echo "No changes to commit."
